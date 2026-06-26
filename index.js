@@ -763,14 +763,34 @@ app.patch('/api/admin/users/:id/block', verifyToken, verifyAdmin, async (req, re
 });
 
 // GET all recipes (admin)
+// GET all recipes (admin) – with pagination, search, status filter
 app.get('/api/admin/recipes', verifyToken, verifyAdmin, async (req, res) => {
     try {
+        const query = {};
         const page = parseInt(req.query.page) || 1;
         const perPage = parseInt(req.query.perPage) || 10;
         const skip = (page - 1) * perPage;
 
-        const total = await recipesCollection.countDocuments();
-        const recipes = await recipesCollection.find({}).sort({ createdAt: -1 }).skip(skip).limit(perPage).toArray();
+        // Search by recipe name or author name
+        if (req.query.search) {
+            query.$or = [
+                { recipeName: { $regex: req.query.search, $options: 'i' } },
+                { authorName: { $regex: req.query.search, $options: 'i' } }
+            ];
+        }
+
+        // Status filter
+        if (req.query.status && req.query.status !== 'all') {
+            query.status = req.query.status;
+        }
+
+        const total = await recipesCollection.countDocuments(query);
+        const recipes = await recipesCollection
+            .find(query)
+            .sort({ createdAt: -1 })
+            .skip(skip)
+            .limit(perPage)
+            .toArray();
 
         res.send({ total, recipes });
     } catch (err) {
@@ -810,6 +830,77 @@ app.patch('/api/admin/recipes/:id', verifyToken, verifyAdmin, async (req, res) =
             { $set: { ...req.body, updatedAt: new Date() } }
         );
         res.send(result);
+    } catch (err) {
+        res.status(500).send({ message: err.message });
+    }
+});
+
+
+// ─── Update recipe status (admin verify) ──────────────────────────
+app.patch('/api/admin/recipes/:id/verify', verifyToken, verifyAdmin, async (req, res) => {
+    try {
+        const { status, isHidden } = req.body;
+        const id = req.params.id;
+        const updateDoc = { updatedAt: new Date() };
+
+        if (status) {
+            const valid = ['pending', 'approved', 'rejected'];
+            if (!valid.includes(status)) {
+                return res.status(400).send({ message: 'Invalid status' });
+            }
+            updateDoc.status = status;
+        }
+        if (typeof isHidden === 'boolean') {
+            updateDoc.isHidden = isHidden;
+        }
+
+        const result = await recipesCollection.updateOne(
+            { _id: new ObjectId(id) },
+            { $set: updateDoc }
+        );
+
+        if (result.matchedCount === 0) {
+            return res.status(404).send({ message: 'Recipe not found' });
+        }
+
+        res.send({ success: true, message: 'Recipe updated' });
+    } catch (err) {
+        res.status(500).send({ message: err.message });
+    }
+});
+
+
+
+// ─── Update recipe status (admin) ──────────────────────────
+app.patch('/api/admin/recipes/:id/status', verifyToken, verifyAdmin, async (req, res) => {
+    try {
+        const { status } = req.body;
+        const id = req.params.id;
+
+        // Validate status
+        const validStatuses = ['pending', 'approved', 'rejected'];
+        if (!validStatuses.includes(status)) {
+            return res.status(400).send({ message: 'Invalid status' });
+        }
+
+        const result = await recipesCollection.updateOne(
+            { _id: new ObjectId(id) },
+            {
+                $set: {
+                    status: status,
+                    updatedAt: new Date()
+                }
+            }
+        );
+
+        if (result.matchedCount === 0) {
+            return res.status(404).send({ message: 'Recipe not found' });
+        }
+
+        res.send({
+            success: true,
+            message: `Status updated to ${status}`
+        });
     } catch (err) {
         res.status(500).send({ message: err.message });
     }
