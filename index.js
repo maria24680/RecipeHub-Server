@@ -311,3 +311,62 @@ app.post('/api/recipes', verifyToken, async (req, res) => {
         res.status(500).send({ message: err.message });
     }
 });
+// PATCH update recipe
+app.patch('/api/recipes/:id', verifyToken, async (req, res) => {
+    try {
+        const recipe = await recipesCollection.findOne({ _id: new ObjectId(req.params.id) });
+        if (!recipe) return res.status(404).send({ message: 'Recipe not found' });
+
+        if (recipe.authorEmail !== req.user.email && req.user.role !== 'admin') {
+            return res.status(403).send({ message: 'Unauthorized' });
+        }
+
+        const result = await recipesCollection.updateOne(
+            { _id: new ObjectId(req.params.id) },
+            { $set: { ...req.body, updatedAt: new Date() } }
+        );
+        res.send(result);
+    } catch (err) {
+        res.status(500).send({ message: err.message });
+    }
+});
+
+// DELETE recipe
+app.delete('/api/recipes/:id', verifyToken, async (req, res) => {
+    try {
+        const recipe = await recipesCollection.findOne({ _id: new ObjectId(req.params.id) });
+        if (!recipe) return res.status(404).send({ message: 'Recipe not found' });
+
+        if (recipe.authorEmail !== req.user.email && req.user.role !== 'admin') {
+            return res.status(403).send({ message: 'Unauthorized' });
+        }
+
+        const result = await recipesCollection.deleteOne({ _id: new ObjectId(req.params.id) });
+        res.send(result);
+    } catch (err) {
+        res.status(500).send({ message: err.message });
+    }
+});
+
+// PATCH toggle like on recipe
+app.patch('/api/recipes/:id/like', verifyToken, async (req, res) => {
+    try {
+        const recipe = await recipesCollection.findOne({ _id: new ObjectId(req.params.id) });
+        if (!recipe) return res.status(404).send({ message: 'Recipe not found' });
+
+        const userEmail = req.user.email;
+        const likedBy = recipe.likedBy || [];
+        const alreadyLiked = likedBy.includes(userEmail);
+
+        const update = alreadyLiked
+            ? { $pull: { likedBy: userEmail }, $inc: { likesCount: -1 } }
+            : { $push: { likedBy: userEmail }, $inc: { likesCount: 1 } };
+
+        await recipesCollection.updateOne({ _id: new ObjectId(req.params.id) }, update);
+
+        const updated = await recipesCollection.findOne({ _id: new ObjectId(req.params.id) });
+        res.send({ liked: !alreadyLiked, likesCount: updated.likesCount });
+    } catch (err) {
+        res.status(500).send({ message: err.message });
+    }
+});
