@@ -431,3 +431,87 @@ app.delete('/api/favorites/:recipeId', verifyToken, async (req, res) => {
         res.status(500).send({ message: err.message });
     }
 });
+// ==========================================
+// 5. REPORTS APIs
+// ==========================================
+
+// POST create report
+app.post('/api/reports', verifyToken, async (req, res) => {
+    try {
+        const { recipeId, reason } = req.body;
+        const reporterEmail = req.user.email;
+
+        const existing = await reportsCollection.findOne({
+            recipeId,
+            reporterEmail,
+            status: 'pending'
+        });
+        if (existing) return res.status(400).send({ message: 'You already reported this recipe' });
+
+        const result = await reportsCollection.insertOne({
+            recipeId,
+            reporterEmail,
+            reason,
+            status: 'pending',
+            createdAt: new Date()
+        });
+        res.send({ success: true, id: result.insertedId });
+    } catch (err) {
+        res.status(500).send({ message: err.message });
+    }
+});
+
+// GET all reports (admin)
+app.get('/api/reports', verifyToken, verifyAdmin, async (req, res) => {
+    try {
+        const query = {};
+        if (req.query.status) query.status = req.query.status;
+
+        const reports = await reportsCollection.find(query).sort({ createdAt: -1 }).toArray();
+
+        // Populate recipe info
+        const populated = await Promise.all(reports.map(async (report) => {
+            try {
+                const recipe = await recipesCollection.findOne({ _id: new ObjectId(report.recipeId) });
+                return { ...report, recipe };
+            } catch {
+                return { ...report, recipe: null };
+            }
+        }));
+
+        res.send(populated);
+    } catch (err) {
+        res.status(500).send({ message: err.message });
+    }
+});
+
+// PATCH dismiss report
+app.patch('/api/reports/:id/dismiss', verifyToken, verifyAdmin, async (req, res) => {
+    try {
+        const result = await reportsCollection.updateOne(
+            { _id: new ObjectId(req.params.id) },
+            { $set: { status: 'dismissed', updatedAt: new Date() } }
+        );
+        res.send(result);
+    } catch (err) {
+        res.status(500).send({ message: err.message });
+    }
+});
+
+// DELETE recipe from report (admin removes the recipe)
+app.delete('/api/reports/:id/remove-recipe', verifyToken, verifyAdmin, async (req, res) => {
+    try {
+        const report = await reportsCollection.findOne({ _id: new ObjectId(req.params.id) });
+        if (!report) return res.status(404).send({ message: 'Report not found' });
+
+        await recipesCollection.deleteOne({ _id: new ObjectId(report.recipeId) });
+        await reportsCollection.updateOne(
+            { _id: new ObjectId(req.params.id) },
+            { $set: { status: 'resolved', updatedAt: new Date() } }
+        );
+
+        res.send({ success: true, message: 'Recipe removed and report resolved' });
+    } catch (err) {
+        res.status(500).send({ message: err.message });
+    }
+});
