@@ -193,3 +193,121 @@ app.get('/api/users/me/stats', verifyToken, async (req, res) => {
         res.status(500).send({ message: err.message });
     }
 });
+// ==========================================
+// 3. RECIPES APIs
+// ==========================================
+
+// GET all recipes with filter, sort, pagination
+app.get('/api/recipes', async (req, res) => {
+    try {
+        const query = {};
+
+        if (req.query.authorEmail) query.authorEmail = req.query.authorEmail;
+
+        // Category filter using $in
+        if (req.query.category) {
+            const categories = req.query.category.split(',');
+            query.category = { $in: categories };
+        }
+
+        if (req.query.search) {
+            query.$or = [
+                { recipeName: { $regex: req.query.search, $options: 'i' } },
+                { ingredients: { $regex: req.query.search, $options: 'i' } }
+            ];
+        }
+
+        // Public view: only show visible recipes
+        if (!req.query.authorEmail && !req.query.admin) {
+            query.isHidden = { $ne: true };
+        }
+
+        let sortObj = { createdAt: -1 };
+        if (req.query.sort === 'popular') sortObj = { likesCount: -1 };
+        if (req.query.sort === 'oldest') sortObj = { createdAt: 1 };
+
+        const page = parseInt(req.query.page) || 1;
+        const perPage = parseInt(req.query.perPage) || 9;
+        const skip = (page - 1) * perPage;
+
+        const total = await recipesCollection.countDocuments(query);
+        const recipes = await recipesCollection.find(query).sort(sortObj).skip(skip).limit(perPage).toArray();
+
+        res.send({ total, recipes });
+    } catch (err) {
+        res.status(500).send({ message: err.message });
+    }
+});
+
+// GET featured recipes (for homepage)
+app.get('/api/recipes/featured', async (req, res) => {
+    try {
+        const recipes = await recipesCollection
+            .find({ isFeatured: true, isHidden: { $ne: true } })
+            .toArray();
+        res.send(recipes);
+    } catch (err) {
+        res.status(500).send({ message: err.message });
+    }
+});
+
+// GET popular recipes (most liked, for homepage)
+app.get('/api/recipes/popular', async (req, res) => {
+    try {
+        const recipes = await recipesCollection
+            .find({ isHidden: { $ne: true } })
+            .sort({ likesCount: -1 })
+            .limit(6)
+            .toArray();
+        res.send(recipes);
+    } catch (err) {
+        res.status(500).send({ message: err.message });
+    }
+});
+
+// GET single recipe
+app.get('/api/recipes/:id', async (req, res) => {
+    try {
+        const recipe = await recipesCollection.findOne({ _id: new ObjectId(req.params.id) });
+        if (!recipe) return res.status(404).send({ message: 'Recipe not found' });
+        res.send(recipe);
+    } catch (err) {
+        res.status(500).send({ message: err.message });
+    }
+});
+
+// POST add new recipe
+app.post('/api/recipes', verifyToken, async (req, res) => {
+    try {
+        const user = req.user;
+
+        // Check recipe limit for non-premium users
+        if (!user.isPremium) {
+            const count = await recipesCollection.countDocuments({ authorEmail: user.email });
+            if (count >= 2) {
+                return res.status(403).send({
+                    message: 'Free users can only add 2 recipes. Upgrade to premium for unlimited recipes.'
+                });
+            }
+        }
+
+        const recipeData = req.body;
+        const newRecipe = {
+            ...recipeData,
+            authorId: user._id.toString(),
+            authorName: user.name,
+            authorEmail: user.email,
+            likesCount: 0,
+            likedBy: [],
+            isFeatured: false,
+            isHidden: false,
+            createdAt: new Date(),
+            updatedAt: new Date()
+        };
+
+        const result = await recipesCollection.insertOne(newRecipe);
+        res.send(result);
+    } catch (err) {
+        res.status(500).send({ message: err.message });
+    }
+});
