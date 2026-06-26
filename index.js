@@ -35,7 +35,7 @@ client.connect()
 
 // MongoDB Collections
 const db = client.db("recipehub");
-const usersCollection = db.collection("users");
+const usersCollection = db.collection("user");
 const recipesCollection = db.collection("recipes");
 const favoritesCollection = db.collection("favorites");
 const reportsCollection = db.collection("reports");
@@ -145,6 +145,7 @@ app.post('/api/auth/logout', async (req, res) => {
         res.status(500).send({ message: err.message });
     }
 });
+
 // ==========================================
 // 2. USER APIs
 // ==========================================
@@ -162,11 +163,28 @@ app.get('/api/users/me', verifyToken, async (req, res) => {
 app.patch('/api/users/me', verifyToken, async (req, res) => {
     try {
         const { name, image } = req.body;
+        const updateData = {};
+        if (name) updateData.name = name;
+        if (image) updateData.image = image;
+        updateData.updatedAt = new Date();
+
+        if (Object.keys(updateData).length === 0) {
+            return res.status(400).send({ message: 'No fields to update' });
+        }
+
         const result = await usersCollection.updateOne(
             { email: req.user.email },
-            { $set: { name, image, updatedAt: new Date() } }
+            { $set: updateData }
         );
-        res.send(result);
+
+        if (result.matchedCount === 0) {
+            return res.status(404).send({ message: 'User not found' });
+        }
+
+        // Fetch updated user and remove password
+        const updatedUser = await usersCollection.findOne({ email: req.user.email });
+        delete updatedUser.password;
+        res.send(updatedUser);
     } catch (err) {
         res.status(500).send({ message: err.message });
     }
@@ -193,6 +211,7 @@ app.get('/api/users/me/stats', verifyToken, async (req, res) => {
         res.status(500).send({ message: err.message });
     }
 });
+
 // ==========================================
 // 3. RECIPES APIs
 // ==========================================
@@ -311,6 +330,7 @@ app.post('/api/recipes', verifyToken, async (req, res) => {
         res.status(500).send({ message: err.message });
     }
 });
+
 // PATCH update recipe
 app.patch('/api/recipes/:id', verifyToken, async (req, res) => {
     try {
@@ -370,6 +390,7 @@ app.patch('/api/recipes/:id/like', verifyToken, async (req, res) => {
         res.status(500).send({ message: err.message });
     }
 });
+
 // ==========================================
 // 4. FAVORITES APIs
 // ==========================================
@@ -431,6 +452,7 @@ app.delete('/api/favorites/:recipeId', verifyToken, async (req, res) => {
         res.status(500).send({ message: err.message });
     }
 });
+
 // ==========================================
 // 5. REPORTS APIs
 // ==========================================
@@ -515,3 +537,290 @@ app.delete('/api/reports/:id/remove-recipe', verifyToken, verifyAdmin, async (re
         res.status(500).send({ message: err.message });
     }
 });
+
+// ==========================================
+// 6. PAYMENT APIs (Stripe)
+// ==========================================
+
+// POST create checkout for premium membership
+app.post('/api/payments/premium-checkout', verifyToken, async (req, res) => {
+    try {
+        const session = await stripe.checkout.sessions.create({
+            payment_method_types: ['card'],
+            mode: 'payment',
+            line_items: [{
+                price_data: {
+                    currency: 'usd',
+                    product_data: { name: 'RecipeHub Premium Membership' },
+                    unit_amount: 999, // $9.99
+                },
+                quantity: 1,
+            }],
+            metadata: {
+                userEmail: req.user.email,
+                userId: req.user._id.toString(),
+                type: 'premium'
+            },
+            success_url: `${process.env.CLIENT_URL}/payment-success?session_id={CHECKOUT_SESSION_ID}`,
+            cancel_url: `${process.env.CLIENT_URL}/dashboard`,
+        });
+
+        res.send({ url: session.url });
+    } catch (err) {
+        res.status(500).send({ message: err.message });
+    }
+});
+
+// POST create checkout for recipe purchase
+app.post('/api/payments/recipe-checkout', verifyToken, async (req, res) => {
+    try {
+        const { recipeId } = req.body;
+
+        const recipe = await recipesCollection.findOne({ _id: new ObjectId(recipeId) });
+        if (!recipe) return res.status(404).send({ message: 'Recipe not found' });
+
+        // Check if already purchased
+        const alreadyPurchased = await purchasesCollection.findOne({
+            recipeId,
+            userEmail: req.user.email
+        });
+        if (alreadyPurchased) return res.status(400).send({ message: 'Already purchased' });
+
+        const session = await stripe.checkout.sessions.create({
+            payment_method_types: ['card'],
+            mode: 'payment',
+            line_items: [{
+                price_data: {
+                    currency: 'usd',
+                    product_data: { name: recipe.recipeName },
+                    unit_amount: (recipe.price || 199), // default $1.99
+                },
+                quantity: 1,
+            }],
+            metadata: {
+                userEmail: req.user.email,
+                userId: req.user._id.toString(),
+                recipeId,
+                type: 'recipe'
+            },
+            success_url: `${process.env.CLIENT_URL}/payment-success?session_id={CHECKOUT_SESSION_ID}`,
+            cancel_url: `${process.env.CLIENT_URL}/recipes/${recipeId}`,
+        });
+
+        res.send({ url: session.url });
+    } catch (err) {
+        res.status(500).send({ message: err.message });
+    }
+});
+
+// POST stripe webhook
+app.post('/api/payments/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+    const sig = req.headers['stripe-signature'];
+    let event;
+
+    try {
+        event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+    } catch (err) {
+        return res.status(400).send({ message: `Webhook Error: ${err.message}` });
+    }
+
+    if (event.type === 'checkout.session.completed') {
+        const session = event.data.object;
+        const { userEmail, userId, recipeId, type } = session.metadata;
+
+        // Save payment record
+        await paymentsCollection.insertOne({
+            userEmail,
+            userId,
+            recipeId: recipeId || null,
+            amount: session.amount_total / 100,
+            transactionId: session.payment_intent,
+            paymentStatus: 'completed',
+            type,
+            paidAt: new Date(),
+            createdAt: new Date()
+        });
+
+        if (type === 'premium') {
+            // Upgrade user to premium
+            await usersCollection.updateOne(
+                { email: userEmail },
+                { $set: { isPremium: true, updatedAt: new Date() } }
+            );
+        }
+
+        if (type === 'recipe' && recipeId) {
+            // Save to purchases
+            await purchasesCollection.insertOne({
+                userEmail,
+                userId,
+                recipeId,
+                transactionId: session.payment_intent,
+                purchasedAt: new Date()
+            });
+        }
+    }
+
+    res.send({ received: true });
+});
+
+// GET verify payment session (after redirect)
+app.get('/api/payments/verify/:sessionId', verifyToken, async (req, res) => {
+    try {
+        const session = await stripe.checkout.sessions.retrieve(req.params.sessionId);
+        if (session.payment_status === 'paid') {
+            res.send({ success: true, metadata: session.metadata });
+        } else {
+            res.send({ success: false });
+        }
+    } catch (err) {
+        res.status(500).send({ message: err.message });
+    }
+});
+
+// GET user purchased recipes
+app.get('/api/purchases', verifyToken, async (req, res) => {
+    try {
+        const purchases = await purchasesCollection
+            .find({ userEmail: req.user.email })
+            .sort({ purchasedAt: -1 })
+            .toArray();
+
+        const populated = await Promise.all(purchases.map(async (p) => {
+            try {
+                const recipe = await recipesCollection.findOne({ _id: new ObjectId(p.recipeId) });
+                return { ...p, recipe };
+            } catch {
+                return { ...p, recipe: null };
+            }
+        }));
+
+        res.send(populated);
+    } catch (err) {
+        res.status(500).send({ message: err.message });
+    }
+});
+
+// GET all transactions (admin)
+app.get('/api/payments', verifyToken, verifyAdmin, async (req, res) => {
+    try {
+        const payments = await paymentsCollection.find({}).sort({ createdAt: -1 }).toArray();
+        res.send(payments);
+    } catch (err) {
+        res.status(500).send({ message: err.message });
+    }
+});
+
+// ==========================================
+// 7. ADMIN APIs
+// ==========================================
+
+// GET admin dashboard stats
+app.get('/api/admin/stats', verifyToken, verifyAdmin, async (req, res) => {
+    try {
+        const [totalUsers, totalRecipes, totalPremium, totalReports] = await Promise.all([
+            usersCollection.countDocuments(),
+            recipesCollection.countDocuments(),
+            usersCollection.countDocuments({ isPremium: true }),
+            reportsCollection.countDocuments({ status: 'pending' })
+        ]);
+
+        res.send({ totalUsers, totalRecipes, totalPremium, totalReports });
+    } catch (err) {
+        res.status(500).send({ message: err.message });
+    }
+});
+
+// GET all users (admin)
+app.get('/api/admin/users', verifyToken, verifyAdmin, async (req, res) => {
+    try {
+        const query = {};
+        if (req.query.search) {
+            query.$or = [
+                { name: { $regex: req.query.search, $options: 'i' } },
+                { email: { $regex: req.query.search, $options: 'i' } }
+            ];
+        }
+        const users = await usersCollection.find(query).sort({ createdAt: -1 }).toArray();
+        res.send(users);
+    } catch (err) {
+        res.status(500).send({ message: err.message });
+    }
+});
+
+// PATCH block/unblock user (admin)
+app.patch('/api/admin/users/:id/block', verifyToken, verifyAdmin, async (req, res) => {
+    try {
+        const { isBlocked } = req.body;
+        const result = await usersCollection.updateOne(
+            { _id: new ObjectId(req.params.id) },
+            { $set: { isBlocked, updatedAt: new Date() } }
+        );
+        res.send(result);
+    } catch (err) {
+        res.status(500).send({ message: err.message });
+    }
+});
+
+// GET all recipes (admin)
+app.get('/api/admin/recipes', verifyToken, verifyAdmin, async (req, res) => {
+    try {
+        const page = parseInt(req.query.page) || 1;
+        const perPage = parseInt(req.query.perPage) || 10;
+        const skip = (page - 1) * perPage;
+
+        const total = await recipesCollection.countDocuments();
+        const recipes = await recipesCollection.find({}).sort({ createdAt: -1 }).skip(skip).limit(perPage).toArray();
+
+        res.send({ total, recipes });
+    } catch (err) {
+        res.status(500).send({ message: err.message });
+    }
+});
+
+// PATCH feature/unfeature recipe (admin)
+app.patch('/api/admin/recipes/:id/feature', verifyToken, verifyAdmin, async (req, res) => {
+    try {
+        const { isFeatured } = req.body;
+        const result = await recipesCollection.updateOne(
+            { _id: new ObjectId(req.params.id) },
+            { $set: { isFeatured, updatedAt: new Date() } }
+        );
+        res.send(result);
+    } catch (err) {
+        res.status(500).send({ message: err.message });
+    }
+});
+
+// DELETE recipe (admin)
+app.delete('/api/admin/recipes/:id', verifyToken, verifyAdmin, async (req, res) => {
+    try {
+        const result = await recipesCollection.deleteOne({ _id: new ObjectId(req.params.id) });
+        res.send(result);
+    } catch (err) {
+        res.status(500).send({ message: err.message });
+    }
+});
+
+// PATCH edit recipe (admin)
+app.patch('/api/admin/recipes/:id', verifyToken, verifyAdmin, async (req, res) => {
+    try {
+        const result = await recipesCollection.updateOne(
+            { _id: new ObjectId(req.params.id) },
+            { $set: { ...req.body, updatedAt: new Date() } }
+        );
+        res.send(result);
+    } catch (err) {
+        res.status(500).send({ message: err.message });
+    }
+});
+
+// ==========================================
+// Start Server
+// ==========================================
+
+app.listen(port, () => {
+    console.log(`RecipeHub backend running on port ${port}`);
+});
+
+module.exports = app;
