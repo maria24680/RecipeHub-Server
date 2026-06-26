@@ -370,3 +370,64 @@ app.patch('/api/recipes/:id/like', verifyToken, async (req, res) => {
         res.status(500).send({ message: err.message });
     }
 });
+// ==========================================
+// 4. FAVORITES APIs
+// ==========================================
+
+// POST add to favorites
+app.post('/api/favorites', verifyToken, async (req, res) => {
+    try {
+        const { recipeId } = req.body;
+        const userEmail = req.user.email;
+
+        const exists = await favoritesCollection.findOne({ recipeId, userEmail });
+        if (exists) return res.status(400).send({ message: 'Already in favorites' });
+
+        const recipe = await recipesCollection.findOne({ _id: new ObjectId(recipeId) });
+        if (!recipe) return res.status(404).send({ message: 'Recipe not found' });
+
+        const result = await favoritesCollection.insertOne({
+            recipeId,
+            userEmail,
+            userId: req.user._id.toString(),
+            addedAt: new Date()
+        });
+        res.send({ success: true, id: result.insertedId });
+    } catch (err) {
+        res.status(500).send({ message: err.message });
+    }
+});
+
+// GET user favorites
+app.get('/api/favorites', verifyToken, async (req, res) => {
+    try {
+        const favorites = await favoritesCollection
+            .find({ userEmail: req.user.email })
+            .sort({ addedAt: -1 })
+            .toArray();
+
+        // Populate recipe details
+        const populated = await Promise.all(favorites.map(async (fav) => {
+            const recipe = await recipesCollection.findOne({ _id: new ObjectId(fav.recipeId) });
+            return { ...fav, recipe };
+        }));
+
+        res.send(populated);
+    } catch (err) {
+        res.status(500).send({ message: err.message });
+    }
+});
+
+// DELETE remove from favorites
+app.delete('/api/favorites/:recipeId', verifyToken, async (req, res) => {
+    try {
+        const result = await favoritesCollection.deleteOne({
+            recipeId: req.params.recipeId,
+            userEmail: req.user.email
+        });
+        if (result.deletedCount === 0) return res.status(404).send({ message: 'Favorite not found' });
+        res.send({ success: true });
+    } catch (err) {
+        res.status(500).send({ message: err.message });
+    }
+});
