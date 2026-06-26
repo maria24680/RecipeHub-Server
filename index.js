@@ -145,3 +145,51 @@ app.post('/api/auth/logout', async (req, res) => {
         res.status(500).send({ message: err.message });
     }
 });
+// ==========================================
+// 2. USER APIs
+// ==========================================
+
+// GET current user
+app.get('/api/users/me', verifyToken, async (req, res) => {
+    try {
+        res.send(req.user);
+    } catch (err) {
+        res.status(500).send({ message: err.message });
+    }
+});
+
+// PATCH update user profile (name & image)
+app.patch('/api/users/me', verifyToken, async (req, res) => {
+    try {
+        const { name, image } = req.body;
+        const result = await usersCollection.updateOne(
+            { email: req.user.email },
+            { $set: { name, image, updatedAt: new Date() } }
+        );
+        res.send(result);
+    } catch (err) {
+        res.status(500).send({ message: err.message });
+    }
+});
+
+// GET user dashboard overview stats
+app.get('/api/users/me/stats', verifyToken, async (req, res) => {
+    try {
+        const email = req.user.email;
+
+        const totalRecipes = await recipesCollection.countDocuments({ authorEmail: email });
+        const totalFavorites = await favoritesCollection.countDocuments({ userEmail: email });
+
+        const userRecipes = await recipesCollection.find({ authorEmail: email }).toArray();
+        const totalLikesReceived = userRecipes.reduce((sum, r) => sum + (r.likesCount || 0), 0);
+
+        res.send({
+            totalRecipes,
+            totalFavorites,
+            totalLikesReceived,
+            isPremium: req.user.isPremium || false
+        });
+    } catch (err) {
+        res.status(500).send({ message: err.message });
+    }
+});
