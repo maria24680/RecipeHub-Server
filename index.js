@@ -484,12 +484,20 @@ app.post('/api/reports', verifyToken, async (req, res) => {
 });
 
 // GET all reports (admin)
+// GET all reports (admin) – with pagination & status filter
 app.get('/api/reports', verifyToken, verifyAdmin, async (req, res) => {
     try {
         const query = {};
-        if (req.query.status) query.status = req.query.status;
+        const page = parseInt(req.query.page) || 1;
+        const perPage = parseInt(req.query.perPage) || 10;
+        const skip = (page - 1) * perPage;
 
-        const reports = await reportsCollection.find(query).sort({ createdAt: -1 }).toArray();
+        if (req.query.status && req.query.status !== 'all') {
+            query.status = req.query.status;
+        }
+
+        const total = await reportsCollection.countDocuments(query);
+        const reports = await reportsCollection.find(query).sort({ createdAt: -1 }).skip(skip).limit(perPage).toArray();
 
         // Populate recipe info
         const populated = await Promise.all(reports.map(async (report) => {
@@ -501,7 +509,7 @@ app.get('/api/reports', verifyToken, verifyAdmin, async (req, res) => {
             }
         }));
 
-        res.send(populated);
+        res.send({ total, reports: populated });
     } catch (err) {
         res.status(500).send({ message: err.message });
     }
@@ -731,32 +739,75 @@ app.get('/api/admin/stats', verifyToken, verifyAdmin, async (req, res) => {
     }
 });
 
-// GET all users (admin)
+// GET all users (admin) – with pagination & search
 app.get('/api/admin/users', verifyToken, verifyAdmin, async (req, res) => {
     try {
         const query = {};
+        const page = parseInt(req.query.page) || 1;
+        const perPage = parseInt(req.query.perPage) || 10;
+        const skip = (page - 1) * perPage;
+
+        // Search by name or email
         if (req.query.search) {
             query.$or = [
                 { name: { $regex: req.query.search, $options: 'i' } },
                 { email: { $regex: req.query.search, $options: 'i' } }
             ];
         }
-        const users = await usersCollection.find(query).sort({ createdAt: -1 }).toArray();
-        res.send(users);
+
+        // Optional role filter
+        if (req.query.role) {
+            query.role = req.query.role;
+        }
+
+        const total = await usersCollection.countDocuments(query);
+        const users = await usersCollection
+            .find(query)
+            .sort({ createdAt: -1 })
+            .skip(skip)
+            .limit(perPage)
+            .toArray();
+
+        // Remove sensitive fields
+        const sanitizedUsers = users.map(user => {
+            const { password, ...rest } = user;
+            return rest;
+        });
+
+        res.send({ total, users: sanitizedUsers });
     } catch (err) {
         res.status(500).send({ message: err.message });
     }
 });
 
+
 // PATCH block/unblock user (admin)
 app.patch('/api/admin/users/:id/block', verifyToken, verifyAdmin, async (req, res) => {
     try {
         const { isBlocked } = req.body;
+        const userId = req.params.id;
+        const adminUser = req.user;
+
+        // Prevent blocking self
+        if (adminUser._id.toString() === userId) {
+            return res.status(400).send({ message: 'You cannot block yourself' });
+        }
+
+        // Find target user
+        const targetUser = await usersCollection.findOne({ _id: new ObjectId(userId) });
+        if (!targetUser) return res.status(404).send({ message: 'User not found' });
+
+        // Prevent blocking other admins
+        if (targetUser.role === 'admin') {
+            return res.status(400).send({ message: 'Cannot block another admin' });
+        }
+
         const result = await usersCollection.updateOne(
-            { _id: new ObjectId(req.params.id) },
+            { _id: new ObjectId(userId) },
             { $set: { isBlocked, updatedAt: new Date() } }
         );
-        res.send(result);
+
+        res.send({ success: true, message: `User ${isBlocked ? 'blocked' : 'unblocked'}` });
     } catch (err) {
         res.status(500).send({ message: err.message });
     }
