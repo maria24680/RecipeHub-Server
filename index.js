@@ -19,8 +19,6 @@ try {
     console.error('❌ Failed to initialize Stripe:', err.message);
 }
 
-
-
 // ─── Webhook route (must be BEFORE express.json()) ──────────
 if (stripe) {
     app.post('/api/payments/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
@@ -75,14 +73,10 @@ if (stripe) {
     });
 }
 
-
-
-
-
 // ─── Regular middleware ──────────────────────────────────────
 app.use(cors({
-    /* origin: process.env.CLIENT_URL || 'http://localhost:3000',
-    credentials: true */
+    origin: process.env.CLIENT_URL || 'http://localhost:3000',
+    credentials: true
 }));
 app.use(express.json());
 
@@ -376,6 +370,7 @@ app.post('/api/recipes', verifyToken, async (req, res) => {
             likedBy: [],
             isFeatured: false,
             isHidden: false,
+            status: 'pending',
             createdAt: new Date(),
             updatedAt: new Date()
         };
@@ -695,6 +690,7 @@ app.get('/api/payments/verify/:sessionId', verifyToken, async (req, res) => {
     }
 });
 
+// ─── Confirm purchase (fallback for success page) ──────────
 app.post('/api/payments/confirm-purchase', verifyToken, async (req, res) => {
     if (!stripe) {
         return res.status(503).send({ error: 'Stripe is not configured' });
@@ -787,12 +783,43 @@ app.get('/api/purchases', verifyToken, async (req, res) => {
     }
 });
 
-// ─── Get all payments (admin) ──────────────────────────────────
+// ─── Get all payments (admin) – with pagination, search, filters ──
 app.get('/api/payments', verifyToken, verifyAdmin, async (req, res) => {
     try {
-        const payments = await paymentsCollection.find({}).sort({ createdAt: -1 }).toArray();
-        res.send(payments);
+        const query = {};
+        const page = parseInt(req.query.page) || 1;
+        const perPage = parseInt(req.query.perPage) || 10;
+        const skip = (page - 1) * perPage;
+
+        // Search by user email or transaction ID
+        if (req.query.search) {
+            query.$or = [
+                { userEmail: { $regex: req.query.search, $options: 'i' } },
+                { transactionId: { $regex: req.query.search, $options: 'i' } }
+            ];
+        }
+
+        // Status filter: completed, pending, failed
+        if (req.query.status && req.query.status !== 'all') {
+            query.paymentStatus = req.query.status;
+        }
+
+        // Type filter: premium, recipe
+        if (req.query.type && req.query.type !== 'all') {
+            query.type = req.query.type;
+        }
+
+        const total = await paymentsCollection.countDocuments(query);
+        const payments = await paymentsCollection
+            .find(query)
+            .sort({ createdAt: -1 })
+            .skip(skip)
+            .limit(perPage)
+            .toArray();
+
+        res.send({ total, payments });
     } catch (err) {
+        console.error('Error fetching payments:', err);
         res.status(500).send({ message: err.message });
     }
 });
