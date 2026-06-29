@@ -19,81 +19,10 @@ try {
     console.error('❌ Failed to initialize Stripe:', err.message);
 }
 
-// ─── Webhook route (must be BEFORE express.json()) ──────────
-if (stripe) {
-    app.post('/api/payments/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
-        const sig = req.headers['stripe-signature'];
-        let event;
-
-        try {
-            event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
-            console.log('Webhook event:', event.type);
-        } catch (err) {
-            console.error('Webhook signature verification failed:', err.message);
-            return res.status(400).send(`Webhook Error: ${err.message}`);
-        }
-
-        if (event.type === 'checkout.session.completed') {
-            const session = event.data.object;
-            const { userEmail, userId, recipeId, type } = session.metadata;
-
-            // ✅ FIX: Check for duplicate payment before inserting
-            const existingPayment = await paymentsCollection.findOne({
-                transactionId: session.payment_intent,
-            });
-
-            if (!existingPayment) {
-                await paymentsCollection.insertOne({
-                    userEmail,
-                    userId,
-                    recipeId: recipeId || null,
-                    amount: session.amount_total / 100,
-                    transactionId: session.payment_intent,
-                    paymentStatus: 'completed',
-                    type,
-                    paidAt: new Date(),
-                    createdAt: new Date()
-                });
-            }
-
-            if (type === 'premium') {
-                await usersCollection.updateOne(
-                    { email: userEmail },
-                    { $set: { isPremium: true, updatedAt: new Date() } }
-                );
-                console.log(`User ${userEmail} upgraded to premium`);
-            }
-
-            if (type === 'recipe' && recipeId) {
-                // ✅ FIX: Check for duplicate purchase before inserting
-                const existingPurchase = await purchasesCollection.findOne({
-                    recipeId,
-                    userEmail,
-                });
-
-                if (!existingPurchase) {
-                    await purchasesCollection.insertOne({
-                        userEmail,
-                        userId,
-                        recipeId,
-                        transactionId: session.payment_intent,
-                        purchasedAt: new Date()
-                    });
-                    console.log(`Recipe ${recipeId} purchased by ${userEmail}`);
-                } else {
-                    console.log(`Recipe ${recipeId} already recorded for ${userEmail}, skipping duplicate`);
-                }
-            }
-        }
-
-        res.send({ received: true });
-    });
-}
-
 // ─── Regular middleware ──────────────────────────────────────
 app.use(cors({
-    /* origin: process.env.CLIENT_URL || 'http://localhost:3000',
-    credentials: true */
+    origin: process.env.CLIENT_URL || 'http://localhost:3000',
+    credentials: true
 }));
 app.use(express.json());
 
@@ -333,8 +262,8 @@ app.get('/api/recipes', async (req, res) => {
 app.get('/api/recipes/featured', async (req, res) => {
     try {
         const recipes = await recipesCollection
-            .find({
-                isFeatured: true,
+            .find({ 
+                isFeatured: true, 
                 isHidden: { $ne: true },
                 status: 'approved'
             })
@@ -349,7 +278,7 @@ app.get('/api/recipes/featured', async (req, res) => {
 app.get('/api/recipes/popular', async (req, res) => {
     try {
         const recipes = await recipesCollection
-            .find({ isHidden: { $ne: true } })
+            .find({ isHidden: { $ne: true }, status: 'approved' })
             .sort({ likesCount: -1 })
             .limit(6)
             .toArray();
@@ -496,8 +425,12 @@ app.get('/api/favorites', verifyToken, async (req, res) => {
             .toArray();
 
         const populated = await Promise.all(favorites.map(async (fav) => {
-            const recipe = await recipesCollection.findOne({ _id: new ObjectId(fav.recipeId) });
-            return { ...fav, recipe };
+            try {
+                const recipe = await recipesCollection.findOne({ _id: new ObjectId(fav.recipeId) });
+                return { ...fav, recipe };
+            } catch {
+                return { ...fav, recipe: null };
+            }
         }));
 
         res.send(populated);
@@ -607,7 +540,7 @@ app.delete('/api/reports/:id/remove-recipe', verifyToken, verifyAdmin, async (re
 });
 
 // ==========================================
-// 6. PAYMENT APIs (Stripe - conditional)
+// 6. PAYMENT APIs (Stripe - NO WEBHOOKS)
 // ==========================================
 
 // ─── Premium membership checkout (BDT) ──────────────────────
@@ -622,10 +555,12 @@ app.post('/api/payments/premium-checkout', verifyToken, async (req, res) => {
             line_items: [{
                 price_data: {
                     currency: 'bdt',
-                    product_data: { name: 'RecipeHub Premium Membership' },
-                    description: 'Unlimited recipe uploads and premium badge',
+                    product_data: { 
+                        name: 'RecipeHub Premium Membership',
+                        description: 'Unlimited recipe uploads and premium badge',
+                    },
+                    unit_amount: 99900,
                 },
-                unit_amount: 99900,
                 quantity: 1,
             }],
             metadata: {
@@ -671,10 +606,12 @@ app.post('/api/payments/recipe-checkout', verifyToken, async (req, res) => {
             line_items: [{
                 price_data: {
                     currency: 'bdt',
-                    product_data: { name: recipe.recipeName },
-                    description: `Premium recipe: ${recipe.recipeName}`,
+                    product_data: { 
+                        name: recipe.recipeName,
+                        description: `Premium recipe: ${recipe.recipeName}`,
+                    },
+                    unit_amount: unitAmount,
                 },
-                unit_amount: unitAmount,
                 quantity: 1,
             }],
             metadata: {
@@ -695,27 +632,7 @@ app.post('/api/payments/recipe-checkout', verifyToken, async (req, res) => {
     }
 });
 
-// ─── Verify payment session ──────────────────────────────────
-app.get('/api/payments/verify/:sessionId', verifyToken, async (req, res) => {
-    if (!stripe) {
-        return res.status(503).send({ error: 'Stripe is not configured' });
-    }
-    try {
-        const session = await stripe.checkout.sessions.retrieve(req.params.sessionId);
-        if (session.payment_status === 'paid') {
-            res.send({ success: true, metadata: session.metadata });
-        } else {
-            res.send({ success: false });
-        }
-    } catch (err) {
-        res.status(500).send({ message: err.message });
-    }
-});
-
-// ─── Confirm purchase (fallback for success page) ──────────
-// ✅ FIXED: Webhook fires first and saves the purchase. When the success page
-// calls this endpoint and finds "already purchased", we return 200 (not 400)
-// so the frontend correctly shows "Purchase recorded successfully".
+// ─── Confirm purchase (Handles everything WITHOUT webhooks) ──────────
 app.post('/api/payments/confirm-purchase', verifyToken, async (req, res) => {
     if (!stripe) {
         return res.status(503).send({ error: 'Stripe is not configured' });
@@ -726,51 +643,75 @@ app.post('/api/payments/confirm-purchase', verifyToken, async (req, res) => {
             return res.status(400).send({ message: 'Session ID is required' });
         }
 
+        // Retrieve the session from Stripe
         const session = await stripe.checkout.sessions.retrieve(sessionId);
+        
+        // Check if payment was successful
         if (session.payment_status !== 'paid') {
-            return res.status(400).send({ message: 'Payment not completed' });
+            return res.status(400).send({ 
+                success: false, 
+                message: 'Payment not completed' 
+            });
         }
 
         const { userEmail, userId, recipeId, type } = session.metadata;
 
+        // Verify the user matches
         if (userEmail !== req.user.email) {
-            return res.status(403).send({ message: 'Unauthorized' });
-        }
-
-        // ✅ FIX: Check for duplicate payment — return 200 if already saved by webhook
-        const existingPayment = await paymentsCollection.findOne({
-            transactionId: session.payment_intent,
-        });
-
-        if (!existingPayment) {
-            await paymentsCollection.insertOne({
-                userEmail,
-                userId: userId || req.user._id.toString(),
-                recipeId: recipeId || null,
-                amount: session.amount_total / 100,
-                transactionId: session.payment_intent,
-                paymentStatus: 'completed',
-                type: type || 'recipe',
-                paidAt: new Date(),
-                createdAt: new Date()
+            return res.status(403).send({ 
+                success: false, 
+                message: 'Unauthorized' 
             });
         }
 
+        // Check if already processed (prevent duplicates)
+        const existingPayment = await paymentsCollection.findOne({
+            transactionId: session.payment_intent
+        });
+
+        if (existingPayment) {
+            return res.send({ 
+                success: true, 
+                message: 'Purchase already confirmed',
+                alreadyProcessed: true 
+            });
+        }
+
+        // ─── Save payment record ───
+        await paymentsCollection.insertOne({
+            userEmail,
+            userId: userId || req.user._id.toString(),
+            recipeId: recipeId || null,
+            amount: session.amount_total / 100,
+            transactionId: session.payment_intent,
+            paymentStatus: 'completed',
+            type: type || 'recipe',
+            paidAt: new Date(),
+            createdAt: new Date()
+        });
+
+        // ─── Handle premium upgrade ───
         if (type === 'premium') {
             await usersCollection.updateOne(
                 { email: userEmail },
-                { $set: { isPremium: true, updatedAt: new Date() } }
+                { 
+                    $set: { 
+                        isPremium: true, 
+                        updatedAt: new Date() 
+                    } 
+                }
             );
+            console.log(`✅ User ${userEmail} upgraded to premium (via confirm-purchase)`);
         }
 
+        // ─── Handle recipe purchase ───
         if (type === 'recipe' && recipeId) {
-            // ✅ FIX: Check if already purchased (webhook may have done it already)
-            // Return 200 either way — "already purchased" is still a success for the user
+            // Check if already purchased
             const existingPurchase = await purchasesCollection.findOne({
                 recipeId,
-                userEmail: req.user.email,
+                userEmail: req.user.email
             });
-
+            
             if (!existingPurchase) {
                 await purchasesCollection.insertOne({
                     userEmail,
@@ -779,16 +720,26 @@ app.post('/api/payments/confirm-purchase', verifyToken, async (req, res) => {
                     transactionId: session.payment_intent,
                     purchasedAt: new Date()
                 });
+                console.log(`✅ Recipe ${recipeId} purchased by ${userEmail} (via confirm-purchase)`);
             }
-
-            // ✅ Always return success — whether we just saved it or it was already there
-            return res.status(200).send({ success: true, message: 'Purchase confirmed' });
         }
 
-        res.status(200).send({ success: true, message: 'Purchase confirmed' });
+        res.send({ 
+            success: true, 
+            message: 'Purchase confirmed successfully',
+            data: {
+                type,
+                recipeId,
+                isPremium: type === 'premium'
+            }
+        });
+
     } catch (err) {
         console.error('Confirm purchase error:', err);
-        res.status(500).send({ message: err.message });
+        res.status(500).send({ 
+            success: false, 
+            message: err.message 
+        });
     }
 });
 
