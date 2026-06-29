@@ -37,17 +37,24 @@ if (stripe) {
             const session = event.data.object;
             const { userEmail, userId, recipeId, type } = session.metadata;
 
-            await paymentsCollection.insertOne({
-                userEmail,
-                userId,
-                recipeId: recipeId || null,
-                amount: session.amount_total / 100,
+            // ✅ FIX: Check for duplicate payment before inserting
+            const existingPayment = await paymentsCollection.findOne({
                 transactionId: session.payment_intent,
-                paymentStatus: 'completed',
-                type,
-                paidAt: new Date(),
-                createdAt: new Date()
             });
+
+            if (!existingPayment) {
+                await paymentsCollection.insertOne({
+                    userEmail,
+                    userId,
+                    recipeId: recipeId || null,
+                    amount: session.amount_total / 100,
+                    transactionId: session.payment_intent,
+                    paymentStatus: 'completed',
+                    type,
+                    paidAt: new Date(),
+                    createdAt: new Date()
+                });
+            }
 
             if (type === 'premium') {
                 await usersCollection.updateOne(
@@ -58,14 +65,24 @@ if (stripe) {
             }
 
             if (type === 'recipe' && recipeId) {
-                await purchasesCollection.insertOne({
-                    userEmail,
-                    userId,
+                // ✅ FIX: Check for duplicate purchase before inserting
+                const existingPurchase = await purchasesCollection.findOne({
                     recipeId,
-                    transactionId: session.payment_intent,
-                    purchasedAt: new Date()
+                    userEmail,
                 });
-                console.log(`Recipe ${recipeId} purchased by ${userEmail}`);
+
+                if (!existingPurchase) {
+                    await purchasesCollection.insertOne({
+                        userEmail,
+                        userId,
+                        recipeId,
+                        transactionId: session.payment_intent,
+                        purchasedAt: new Date()
+                    });
+                    console.log(`Recipe ${recipeId} purchased by ${userEmail}`);
+                } else {
+                    console.log(`Recipe ${recipeId} already recorded for ${userEmail}, skipping duplicate`);
+                }
             }
         }
 
@@ -316,7 +333,12 @@ app.get('/api/recipes', async (req, res) => {
 app.get('/api/recipes/featured', async (req, res) => {
     try {
         const recipes = await recipesCollection
-            .find({ isFeatured: true, isHidden: { $ne: true } })
+            .find({
+                isFeatured: true,
+                isHidden: { $ne: true },
+                status: 'approved'
+            })
+            .limit(6)
             .toArray();
         res.send(recipes);
     } catch (err) {
@@ -691,6 +713,9 @@ app.get('/api/payments/verify/:sessionId', verifyToken, async (req, res) => {
 });
 
 // ─── Confirm purchase (fallback for success page) ──────────
+// ✅ FIXED: Webhook fires first and saves the purchase. When the success page
+// calls this endpoint and finds "already purchased", we return 200 (not 400)
+// so the frontend correctly shows "Purchase recorded successfully".
 app.post('/api/payments/confirm-purchase', verifyToken, async (req, res) => {
     if (!stripe) {
         return res.status(503).send({ error: 'Stripe is not configured' });
@@ -712,29 +737,24 @@ app.post('/api/payments/confirm-purchase', verifyToken, async (req, res) => {
             return res.status(403).send({ message: 'Unauthorized' });
         }
 
-        // Check duplicate purchase
-        if (type === 'recipe' && recipeId) {
-            const existing = await purchasesCollection.findOne({
-                recipeId,
-                userEmail: req.user.email
-            });
-            if (existing) {
-                return res.status(400).send({ message: 'Already purchased' });
-            }
-        }
-
-        // Save payment record
-        await paymentsCollection.insertOne({
-            userEmail,
-            userId: userId || req.user._id.toString(),
-            recipeId: recipeId || null,
-            amount: session.amount_total / 100,
+        // ✅ FIX: Check for duplicate payment — return 200 if already saved by webhook
+        const existingPayment = await paymentsCollection.findOne({
             transactionId: session.payment_intent,
-            paymentStatus: 'completed',
-            type: type || 'recipe',
-            paidAt: new Date(),
-            createdAt: new Date()
         });
+
+        if (!existingPayment) {
+            await paymentsCollection.insertOne({
+                userEmail,
+                userId: userId || req.user._id.toString(),
+                recipeId: recipeId || null,
+                amount: session.amount_total / 100,
+                transactionId: session.payment_intent,
+                paymentStatus: 'completed',
+                type: type || 'recipe',
+                paidAt: new Date(),
+                createdAt: new Date()
+            });
+        }
 
         if (type === 'premium') {
             await usersCollection.updateOne(
@@ -744,16 +764,28 @@ app.post('/api/payments/confirm-purchase', verifyToken, async (req, res) => {
         }
 
         if (type === 'recipe' && recipeId) {
-            await purchasesCollection.insertOne({
-                userEmail,
-                userId: userId || req.user._id.toString(),
+            // ✅ FIX: Check if already purchased (webhook may have done it already)
+            // Return 200 either way — "already purchased" is still a success for the user
+            const existingPurchase = await purchasesCollection.findOne({
                 recipeId,
-                transactionId: session.payment_intent,
-                purchasedAt: new Date()
+                userEmail: req.user.email,
             });
+
+            if (!existingPurchase) {
+                await purchasesCollection.insertOne({
+                    userEmail,
+                    userId: userId || req.user._id.toString(),
+                    recipeId,
+                    transactionId: session.payment_intent,
+                    purchasedAt: new Date()
+                });
+            }
+
+            // ✅ Always return success — whether we just saved it or it was already there
+            return res.status(200).send({ success: true, message: 'Purchase confirmed' });
         }
 
-        res.send({ success: true, message: 'Purchase confirmed' });
+        res.status(200).send({ success: true, message: 'Purchase confirmed' });
     } catch (err) {
         console.error('Confirm purchase error:', err);
         res.status(500).send({ message: err.message });
@@ -1052,23 +1084,6 @@ app.patch('/api/admin/recipes/:id/status', verifyToken, verifyAdmin, async (req,
         }
 
         res.send({ success: true, message: `Status updated to ${status}` });
-    } catch (err) {
-        res.status(500).send({ message: err.message });
-    }
-});
-
-// GET featured recipes (for homepage)
-app.get('/api/recipes/featured', async (req, res) => {
-    try {
-        const recipes = await recipesCollection
-            .find({ 
-                isFeatured: true, 
-                isHidden: { $ne: true },
-                status: 'approved'   // ✅ only show approved featured recipes
-            })
-            .limit(6)                // optional: limit to 6
-            .toArray();
-        res.send(recipes);
     } catch (err) {
         res.status(500).send({ message: err.message });
     }
