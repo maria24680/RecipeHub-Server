@@ -27,9 +27,9 @@ if (stripe) {
 
         try {
             event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
-            console.log('🔔 Webhook event received:', event.type);
+            console.log('Webhook event:', event.type);
         } catch (err) {
-            console.error('❌ Webhook signature verification failed:', err.message);
+            console.error('Webhook signature verification failed:', err.message);
             return res.status(400).send(`Webhook Error: ${err.message}`);
         }
 
@@ -37,54 +37,35 @@ if (stripe) {
             const session = event.data.object;
             const { userEmail, userId, recipeId, type } = session.metadata;
 
-            console.log(`📍 Processing ${type} payment for ${userEmail}`);
+            await paymentsCollection.insertOne({
+                userEmail,
+                userId,
+                recipeId: recipeId || null,
+                amount: session.amount_total / 100,
+                transactionId: session.payment_intent,
+                paymentStatus: 'completed',
+                type,
+                paidAt: new Date(),
+                createdAt: new Date()
+            });
 
-            try {
-                // ─── Record payment ───
-                await paymentsCollection.insertOne({
+            if (type === 'premium') {
+                await usersCollection.updateOne(
+                    { email: userEmail },
+                    { $set: { isPremium: true, updatedAt: new Date() } }
+                );
+                console.log(`User ${userEmail} upgraded to premium`);
+            }
+
+            if (type === 'recipe' && recipeId) {
+                await purchasesCollection.insertOne({
                     userEmail,
                     userId,
-                    recipeId: recipeId || null,
-                    amount: session.amount_total / 100,
+                    recipeId,
                     transactionId: session.payment_intent,
-                    paymentStatus: 'completed',
-                    type,
-                    paidAt: new Date(),
-                    createdAt: new Date()
+                    purchasedAt: new Date()
                 });
-                console.log(`✅ Payment recorded for ${userEmail}`);
-
-                // ─── Handle premium upgrade ───
-                if (type === 'premium') {
-                    await usersCollection.updateOne(
-                        { email: userEmail },
-                        { $set: { isPremium: true, updatedAt: new Date() } }
-                    );
-                    console.log(`✨ User ${userEmail} upgraded to premium`);
-                }
-
-                // ─── Handle recipe purchase ───
-                if (type === 'recipe' && recipeId) {
-                    const existing = await purchasesCollection.findOne({
-                        recipeId,
-                        userEmail
-                    });
-
-                    if (!existing) {
-                        await purchasesCollection.insertOne({
-                            userEmail,
-                            userId,
-                            recipeId,
-                            transactionId: session.payment_intent,
-                            purchasedAt: new Date()
-                        });
-                        console.log(`📗 Recipe ${recipeId} purchased by ${userEmail}`);
-                    } else {
-                        console.log(`⚠️ Duplicate purchase prevented for ${userEmail}, recipe ${recipeId}`);
-                    }
-                }
-            } catch (err) {
-                console.error('❌ Error processing webhook:', err);
+                console.log(`Recipe ${recipeId} purchased by ${userEmail}`);
             }
         }
 
@@ -98,11 +79,6 @@ app.use(cors({
     credentials: true */
 }));
 app.use(express.json());
-
-// ─── Health Check ───────────────────────────────────────────
-app.get('/api/health', (req, res) => {
-    res.send({ status: 'OK', timestamp: new Date().toISOString() });
-});
 
 // Root Route
 app.get('/', (req, res) => {
@@ -119,24 +95,19 @@ const client = new MongoClient(uri, {
     }
 });
 
-let paymentsCollection, purchasesCollection, usersCollection, recipesCollection, 
-    favoritesCollection, reportsCollection, sessionsCollection;
-
 client.connect()
-    .then(() => {
-        console.log('✅ Successfully connected to MongoDB!');
-        
-        // Initialize collections
-        const db = client.db("recipehub");
-        usersCollection = db.collection("user");
-        recipesCollection = db.collection("recipes");
-        favoritesCollection = db.collection("favorites");
-        reportsCollection = db.collection("reports");
-        paymentsCollection = db.collection("payments");
-        purchasesCollection = db.collection("purchases");
-        sessionsCollection = db.collection("session");
-    })
+    .then(() => console.log('✅ Successfully connected to MongoDB!'))
     .catch(err => console.error('❌ MongoDB connection error:', err));
+
+// MongoDB Collections
+const db = client.db("recipehub");
+const usersCollection = db.collection("user");
+const recipesCollection = db.collection("recipes");
+const favoritesCollection = db.collection("favorites");
+const reportsCollection = db.collection("reports");
+const paymentsCollection = db.collection("payments");
+const purchasesCollection = db.collection("purchases");
+const sessionsCollection = db.collection("session");
 
 // ==========================================
 // MIDDLEWARES
@@ -345,8 +316,7 @@ app.get('/api/recipes', async (req, res) => {
 app.get('/api/recipes/featured', async (req, res) => {
     try {
         const recipes = await recipesCollection
-            .find({ isFeatured: true, isHidden: { $ne: true }, status: 'approved' })
-            .limit(6)
+            .find({ isFeatured: true, isHidden: { $ne: true } })
             .toArray();
         res.send(recipes);
     } catch (err) {
@@ -357,7 +327,7 @@ app.get('/api/recipes/featured', async (req, res) => {
 app.get('/api/recipes/popular', async (req, res) => {
     try {
         const recipes = await recipesCollection
-            .find({ isHidden: { $ne: true }, status: 'approved' })
+            .find({ isHidden: { $ne: true } })
             .sort({ likesCount: -1 })
             .limit(6)
             .toArray();
@@ -703,46 +673,24 @@ app.post('/api/payments/recipe-checkout', verifyToken, async (req, res) => {
     }
 });
 
-// ─── Verify payment session (check Stripe, don't write DB) ───
+// ─── Verify payment session ──────────────────────────────────
 app.get('/api/payments/verify/:sessionId', verifyToken, async (req, res) => {
     if (!stripe) {
         return res.status(503).send({ error: 'Stripe is not configured' });
     }
     try {
-        const sessionId = req.params.sessionId;
-        console.log(`🔍 Verifying session: ${sessionId} for ${req.user.email}`);
-
-        const session = await stripe.checkout.sessions.retrieve(sessionId);
-        
-        if (!session) {
-            return res.status(404).send({ success: false, message: 'Session not found' });
+        const session = await stripe.checkout.sessions.retrieve(req.params.sessionId);
+        if (session.payment_status === 'paid') {
+            res.send({ success: true, metadata: session.metadata });
+        } else {
+            res.send({ success: false });
         }
-
-        // Check if payment is actually paid
-        if (session.payment_status !== 'paid') {
-            console.log(`⚠️ Payment not paid yet. Status: ${session.payment_status}`);
-            return res.send({ success: false, paymentStatus: session.payment_status });
-        }
-
-        // Verify the user matches
-        if (session.metadata?.userEmail !== req.user.email) {
-            console.log(`⚠️ User mismatch: ${session.metadata?.userEmail} vs ${req.user.email}`);
-            return res.status(403).send({ success: false, message: 'Unauthorized' });
-        }
-
-        console.log(`✅ Payment verified for ${req.user.email}`);
-        res.send({ 
-            success: true, 
-            metadata: session.metadata,
-            paymentStatus: session.payment_status
-        });
     } catch (err) {
-        console.error('Verification error:', err);
         res.status(500).send({ message: err.message });
     }
 });
 
-// ─── Confirm purchase (finalize the purchase in DB) ────────
+// ─── Confirm purchase (fallback for success page) ──────────
 app.post('/api/payments/confirm-purchase', verifyToken, async (req, res) => {
     if (!stripe) {
         return res.status(503).send({ error: 'Stripe is not configured' });
@@ -753,47 +701,30 @@ app.post('/api/payments/confirm-purchase', verifyToken, async (req, res) => {
             return res.status(400).send({ message: 'Session ID is required' });
         }
 
-        console.log(`📝 Confirming purchase for ${req.user.email}, session: ${sessionId}`);
-
         const session = await stripe.checkout.sessions.retrieve(sessionId);
-        if (!session) {
-            return res.status(404).send({ message: 'Session not found' });
-        }
-
         if (session.payment_status !== 'paid') {
             return res.status(400).send({ message: 'Payment not completed' });
         }
 
         const { userEmail, userId, recipeId, type } = session.metadata;
 
-        // Verify user ownership
         if (userEmail !== req.user.email) {
             return res.status(403).send({ message: 'Unauthorized' });
         }
 
-        // ──────────────────────────────────────────────
-        // IDEMPOTENT: Check if already processed
-        // ──────────────────────────────────────────────
-        const existingPayment = await paymentsCollection.findOne({
-            transactionId: session.payment_intent,
-            userEmail
-        });
-
-        if (existingPayment) {
-            console.log(`♻️ Purchase already confirmed for this transaction: ${session.payment_intent}`);
-            return res.send({ 
-                success: true, 
-                message: 'Purchase already confirmed',
-                alreadyProcessed: true 
+        // Check duplicate purchase
+        if (type === 'recipe' && recipeId) {
+            const existing = await purchasesCollection.findOne({
+                recipeId,
+                userEmail: req.user.email
             });
+            if (existing) {
+                return res.status(400).send({ message: 'Already purchased' });
+            }
         }
 
-        // ──────────────────────────────────────────────
-        // NEW PURCHASE: Record it now
-        // ──────────────────────────────────────────────
-
-        // 1. Record payment
-        const paymentResult = await paymentsCollection.insertOne({
+        // Save payment record
+        await paymentsCollection.insertOne({
             userEmail,
             userId: userId || req.user._id.toString(),
             recipeId: recipeId || null,
@@ -804,53 +735,27 @@ app.post('/api/payments/confirm-purchase', verifyToken, async (req, res) => {
             paidAt: new Date(),
             createdAt: new Date()
         });
-        console.log(`✅ Payment record created: ${paymentResult.insertedId}`);
 
-        // 2. Handle premium upgrade
         if (type === 'premium') {
             await usersCollection.updateOne(
                 { email: userEmail },
                 { $set: { isPremium: true, updatedAt: new Date() } }
             );
-            console.log(`✨ Premium status updated for ${userEmail}`);
         }
 
-        // 3. Handle recipe purchase
         if (type === 'recipe' && recipeId) {
-            // Double-check recipe exists
-            const recipe = await recipesCollection.findOne({ _id: new ObjectId(recipeId) });
-            if (!recipe) {
-                return res.status(404).send({ message: 'Recipe not found' });
-            }
-
-            // Check if already purchased (race condition protection)
-            const existingPurchase = await purchasesCollection.findOne({
+            await purchasesCollection.insertOne({
+                userEmail,
+                userId: userId || req.user._id.toString(),
                 recipeId,
-                userEmail: req.user.email
+                transactionId: session.payment_intent,
+                purchasedAt: new Date()
             });
-
-            if (!existingPurchase) {
-                await purchasesCollection.insertOne({
-                    userEmail,
-                    userId: userId || req.user._id.toString(),
-                    recipeId,
-                    transactionId: session.payment_intent,
-                    purchasedAt: new Date()
-                });
-                console.log(`📗 Purchase record created for recipe ${recipeId}`);
-            } else {
-                console.log(`⚠️ Purchase record already exists for ${recipeId}`);
-            }
         }
 
-        res.send({ 
-            success: true, 
-            message: 'Purchase confirmed successfully',
-            alreadyProcessed: false
-        });
-
+        res.send({ success: true, message: 'Purchase confirmed' });
     } catch (err) {
-        console.error('❌ Confirm purchase error:', err);
+        console.error('Confirm purchase error:', err);
         res.status(500).send({ message: err.message });
     }
 });
@@ -1147,6 +1052,23 @@ app.patch('/api/admin/recipes/:id/status', verifyToken, verifyAdmin, async (req,
         }
 
         res.send({ success: true, message: `Status updated to ${status}` });
+    } catch (err) {
+        res.status(500).send({ message: err.message });
+    }
+});
+
+// GET featured recipes (for homepage)
+app.get('/api/recipes/featured', async (req, res) => {
+    try {
+        const recipes = await recipesCollection
+            .find({ 
+                isFeatured: true, 
+                isHidden: { $ne: true },
+                status: 'approved'   // ✅ only show approved featured recipes
+            })
+            .limit(6)                // optional: limit to 6
+            .toArray();
+        res.send(recipes);
     } catch (err) {
         res.status(500).send({ message: err.message });
     }
