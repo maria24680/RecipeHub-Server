@@ -1057,6 +1057,23 @@ app.patch('/api/admin/recipes/:id/status', verifyToken, verifyAdmin, async (req,
     }
 });
 
+// GET featured recipes (for homepage)
+app.get('/api/recipes/featured', async (req, res) => {
+    try {
+        const recipes = await recipesCollection
+            .find({ 
+                isFeatured: true, 
+                isHidden: { $ne: true },
+                status: 'approved'   // ✅ only show approved featured recipes
+            })
+            .limit(6)                // optional: limit to 6
+            .toArray();
+        res.send(recipes);
+    } catch (err) {
+        res.status(500).send({ message: err.message });
+    }
+});
+
 // ==========================================
 // Start Server
 // ==========================================
